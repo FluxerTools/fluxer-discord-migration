@@ -7,13 +7,26 @@ from typing import Any
 
 import aiohttp
 
+from utils.ratelimit import RateLimitedClient
+
+from .sync_helpers import (
+    CATEGORY_TYPE,
+    VOICE_TYPE,
+    confirm,
+    confirm_deletions,
+    fluxer_type_for,
+    summarise,
+)
+
 
 class ServerMigrator:
     """Handles migration of Discord servers to Fluxer."""
 
     def __init__(self, discord_http, fluxer_http, logger):
         self.discord_http = discord_http
-        self.fluxer_http = fluxer_http
+        # Paces role/channel creation so Fluxer's 10-per-60s limit is respected
+        # up front instead of being discovered through 429 retries.
+        self.fluxer_http = RateLimitedClient(fluxer_http, logger)
         self.logger = logger
         # Maps Discord IDs to Fluxer IDs
         self.guild_id_map: dict[str, str] = {}
@@ -220,24 +233,670 @@ class ServerMigrator:
             traceback.print_exc()
             return False
 
-    async def _reorder_roles(
-        self, fluxer_guild_id: str, role_positions: list[dict[str, Any]]
+    async def reconfigure_server(
+        self,
+        discord_guild: dict[str, Any],
+        fluxer_guild_id: str,
+        phases: dict[str, bool] | None = None,
+    ) -> bool:
+        """Bring an already-migrated Fluxer server back in line with Discord.
+
+        Unlike a migration this is a two-way sync: items missing on Fluxer are
+        created, items that differ are updated, and items that exist only on
+        Fluxer can be deleted. Every phase asks before it runs, and every
+        deletion is listed and confirmed separately before anything is removed.
+        """
+        if phases is None:
+            phases = {
+                "settings": True,
+                "roles": True,
+                "channels": True,
+                "emojis": True,
+                "stickers": True,
+            }
+
+        guild_id = discord_guild["id"]
+        self.logger.log(f"\n=== Reconfiguring: {discord_guild['name']} ===")
+        self.logger.log(f"Target Fluxer guild: {fluxer_guild_id}")
+
+        if phases.get("settings"):
+            await self._sync_server_settings(discord_guild, fluxer_guild_id)
+
+        # Roles must come before channels: permission overwrites depend on
+        # role_id_map being populated.
+        if phases.get("roles") or phases.get("channels"):
+            await self._sync_roles(
+                guild_id, fluxer_guild_id, apply_changes=bool(phases.get("roles"))
+            )
+
+        if phases.get("channels"):
+            await self._sync_channels(guild_id, fluxer_guild_id)
+
+        if phases.get("emojis"):
+            await self._sync_emojis(guild_id, fluxer_guild_id)
+
+        if phases.get("stickers"):
+            await self._sync_stickers(guild_id, fluxer_guild_id)
+
+        self.logger.log("\n=== Reconfigure complete ===")
+        return True
+
+    async def _sync_server_settings(
+        self, discord_guild: dict[str, Any], fluxer_guild_id: str
     ):
-        """Reorder roles to match Discord hierarchy.
+        """Sync the guild name and icon."""
+        self.logger.log("\n--- Server Settings ---")
+
+        try:
+            fluxer_guild = await self.fluxer_http.get_guild(fluxer_guild_id)
+        except Exception as e:
+            self.logger.log(f"Could not read Fluxer server settings: {e}", "WARN")
+            fluxer_guild = {}
+
+        discord_name = discord_guild.get("name")
+        fluxer_name = fluxer_guild.get("name")
+
+        changes: list[str] = []
+        if discord_name and discord_name != fluxer_name:
+            changes.append(f"name: '{fluxer_name}' -> '{discord_name}'")
+
+        icon_hash = discord_guild.get("icon")
+        update_icon = bool(icon_hash)
+        if update_icon:
+            changes.append("icon: re-upload from Discord")
+
+        if not changes:
+            self.logger.log("Server settings already match")
+            return
+
+        for change in changes:
+            self.logger.log(f"  {change}")
+
+        if not confirm("  Apply these server setting changes?"):
+            self.logger.log("Skipped server settings", "INFO")
+            return
+
+        kwargs: dict[str, Any] = {}
+        if discord_name and discord_name != fluxer_name:
+            kwargs["name"] = discord_name
+
+        if update_icon:
+            ext = "gif" if str(icon_hash).startswith("a_") else "png"
+            icon_url = (
+                f"https://cdn.discordapp.com/icons/{discord_guild['id']}/"
+                f"{icon_hash}.{ext}?size=512"
+            )
+            icon_data = await self._download_image(icon_url)
+            if icon_data:
+                kwargs["icon"] = icon_data
+            else:
+                self.logger.log("  Could not download guild icon", "WARN")
+
+        if not kwargs:
+            return
+
+        try:
+            await self.fluxer_http.modify_guild(fluxer_guild_id, **kwargs)
+            self.logger.log("  ✓ Server settings updated")
+        except Exception as e:
+            self.logger.log(f"  Failed to update server settings: {e}", "WARN")
+
+    async def _sync_roles(
+        self, guild_id: str, fluxer_guild_id: str, apply_changes: bool = True
+    ):
+        """Create, update, reorder and optionally delete roles.
+
+        When apply_changes is False the Fluxer roles are only mapped onto their
+        Discord counterparts (so channel permissions still work) without
+        changing anything.
+        """
+        if apply_changes:
+            self.logger.log("\n--- Roles ---")
+
+        try:
+            discord_roles = await self.discord_http.get_guild_roles(guild_id)
+            fluxer_roles = await self.fluxer_http.get_guild_roles(fluxer_guild_id)
+        except Exception as e:
+            self.logger.log(f"Failed to fetch roles: {e}", "ERROR")
+            return
+
+        fluxer_by_name = {r["name"]: r for r in fluxer_roles}
+
+        everyone = next(
+            (r for r in discord_roles if r.get("name") == "@everyone"), None
+        )
+        if everyone and "@everyone" in fluxer_by_name:
+            self.role_id_map[everyone["id"]] = fluxer_by_name["@everyone"]["id"]
+
+        wanted = [
+            r
+            for r in discord_roles
+            if r.get("name") != "@everyone" and not r.get("managed")
+        ]
+        wanted_names = {r["name"] for r in wanted}
+
+        # Map everything that already matches, so permissions work even if the
+        # user declines the role changes.
+        for role in wanted:
+            match = fluxer_by_name.get(role["name"])
+            if match:
+                self.role_id_map[role["id"]] = match["id"]
+
+        if not apply_changes:
+            return
+
+        to_create = [r for r in wanted if r["name"] not in fluxer_by_name]
+        extra = [
+            r
+            for r in fluxer_roles
+            if r.get("name") not in wanted_names and r.get("name") != "@everyone"
+        ]
+
+        created = updated = deleted = unchanged = 0
+
+        # --- create missing ---
+        if to_create:
+            self.logger.log(f"\n{len(to_create)} role(s) missing on Fluxer:")
+            for r in to_create:
+                self.logger.log(f"  • {r['name']}")
+            if confirm(f"  Create these {len(to_create)} role(s)?", default_no=False):
+                for role in sorted(
+                    to_create, key=lambda r: (r.get("position", 0), int(r["id"]))
+                ):
+                    name = role["name"]
+                    color = role.get("color", 0)
+                    permissions = int(role.get("permissions", 0))
+                    hoist = role.get("hoist", False)
+                    mentionable = role.get("mentionable", False)
+                    self.logger.log(f"Creating role: {name}")
+                    try:
+                        new_role = await self.fluxer_http.create_guild_role(
+                            fluxer_guild_id,
+                            name=name,
+                            permissions=permissions,
+                            color=color,
+                            hoist=hoist,
+                            mentionable=mentionable,
+                        )
+                        self.role_id_map[role["id"]] = new_role["id"]
+                        fluxer_by_name[name] = new_role
+                        await self._apply_role_flags(
+                            fluxer_guild_id,
+                            new_role["id"],
+                            name,
+                            hoist=hoist,
+                            mentionable=mentionable,
+                        )
+                        self.logger.log(f"  ✓ Created {name}")
+                        created += 1
+                    except Exception as e:
+                        self.logger.log(f"  Failed to create '{name}': {e}", "WARN")
+            else:
+                self.logger.log("Skipped creating roles")
+
+        # --- update changed ---
+        differing = []
+        for role in wanted:
+            target = fluxer_by_name.get(role["name"])
+            if not target:
+                continue
+            if (
+                target.get("color") == role.get("color", 0)
+                and bool(target.get("hoist")) == role.get("hoist", False)
+                and bool(target.get("mentionable")) == role.get("mentionable", False)
+            ):
+                unchanged += 1
+            else:
+                differing.append((role, target))
+
+        if differing:
+            self.logger.log(f"\n{len(differing)} role(s) differ from Discord:")
+            for role, _ in differing:
+                self.logger.log(f"  • {role['name']}")
+            if confirm(
+                f"  Update these {len(differing)} role(s) "
+                "(colour, permissions, hoist, mentionable)?",
+                default_no=False,
+            ):
+                for role, target in differing:
+                    name = role["name"]
+                    try:
+                        await self.fluxer_http.modify_guild_role(
+                            fluxer_guild_id,
+                            target["id"],
+                            color=role.get("color", 0),
+                            permissions=int(role.get("permissions", 0)),
+                            hoist=role.get("hoist", False),
+                            mentionable=role.get("mentionable", False),
+                        )
+                        self.logger.log(f"  ✓ Updated {name}")
+                        updated += 1
+                    except Exception as e:
+                        self.logger.log(f"  Failed to update '{name}': {e}", "WARN")
+            else:
+                self.logger.log("Skipped role updates")
+
+        # --- delete extras ---
+        if extra:
+            names = [r.get("name", "?") for r in extra]
+            if confirm_deletions("ROLES", names, self.logger):
+                for role in extra:
+                    try:
+                        await self.fluxer_http.delete_guild_role(
+                            fluxer_guild_id, role["id"]
+                        )
+                        self.logger.log(f"  ✓ Deleted role {role.get('name')}")
+                        deleted += 1
+                    except Exception as e:
+                        self.logger.log(
+                            f"  Failed to delete '{role.get('name')}': {e}", "WARN"
+                        )
+                extra = []
+
+        # --- reorder to match Discord ---
+        ordered: list[str] = []
+        for role in sorted(wanted, key=lambda r: (r.get("position", 0), int(r["id"]))):
+            target = fluxer_by_name.get(role["name"])
+            if target:
+                ordered.append(target["id"])
+
+        kept_ids = {r["id"] for r in extra}
+        leftovers = [
+            r
+            for r in fluxer_roles
+            if r["id"] in kept_ids and r.get("name") != "@everyone"
+        ]
+        ordered += [
+            r["id"] for r in sorted(leftovers, key=lambda r: r.get("position", 0))
+        ]
+
+        if ordered:
+            await self._reorder_roles(fluxer_guild_id, ordered)
+
+        self.logger.log(
+            "Roles: " + summarise(created, updated, deleted, unchanged)
+        )
+
+    async def _sync_channels(self, guild_id: str, fluxer_guild_id: str):
+        """Create, update, reorder and optionally delete categories/channels."""
+        self.logger.log("\n--- Channels & Categories ---")
+
+        try:
+            discord_channels = await self.discord_http.get_guild_channels(guild_id)
+            fluxer_channels = await self.fluxer_http.get_guild_channels(
+                fluxer_guild_id
+            )
+        except Exception as e:
+            self.logger.log(f"Failed to fetch channels: {e}", "ERROR")
+            return
+
+        # Fluxer channels keyed by (type, name): a category and a text channel
+        # may legitimately share a name.
+        fluxer_by_key: dict[tuple[int, str], dict[str, Any]] = {}
+        for ch in fluxer_channels:
+            fluxer_by_key[(ch.get("type", 0), ch.get("name", ""))] = ch
+
+        wanted: list[tuple[dict[str, Any], int]] = []
+        for ch in discord_channels:
+            mapped = fluxer_type_for(ch.get("type", 0))
+            if mapped is None:
+                self.logger.log(
+                    f"Skipping unsupported channel: {ch.get('name')}", "WARN"
+                )
+                continue
+            wanted.append((ch, mapped))
+
+        wanted_keys = {(mapped, ch.get("name", "")) for ch, mapped in wanted}
+
+        created = updated = deleted = unchanged = 0
+
+        # --- categories first, so children can be parented ---
+        for ch, mapped in sorted(
+            wanted, key=lambda cm: cm[0].get("position", 0)
+        ):
+            if mapped != CATEGORY_TYPE:
+                continue
+            key = (mapped, ch["name"])
+            existing = fluxer_by_key.get(key)
+            if existing:
+                self.category_id_map[ch["id"]] = existing["id"]
+
+        to_create = [
+            (ch, mapped)
+            for ch, mapped in wanted
+            if (mapped, ch.get("name", "")) not in fluxer_by_key
+        ]
+        extra = [
+            ch
+            for ch in fluxer_channels
+            if (ch.get("type", 0), ch.get("name", "")) not in wanted_keys
+        ]
+
+        # --- create missing (categories before their children) ---
+        if to_create:
+            self.logger.log(f"\n{len(to_create)} channel(s) missing on Fluxer:")
+            for ch, mapped in to_create:
+                kind = "category" if mapped == CATEGORY_TYPE else (
+                    "voice" if mapped == VOICE_TYPE else "text"
+                )
+                self.logger.log(f"  • [{kind}] {ch.get('name')}")
+            if confirm(
+                f"  Create these {len(to_create)} channel(s)?", default_no=False
+            ):
+                ordered_create = sorted(
+                    to_create,
+                    key=lambda cm: (
+                        0 if cm[1] == CATEGORY_TYPE else 1,
+                        cm[0].get("position", 0),
+                    ),
+                )
+                for ch, mapped in ordered_create:
+                    name = ch.get("name", "unnamed")
+                    parent = None
+                    if ch.get("parent_id"):
+                        parent = self.category_id_map.get(ch["parent_id"])
+                    self.logger.log(f"Creating channel: {name}")
+                    try:
+                        kwargs: dict[str, Any] = {
+                            "name": name,
+                            "type": mapped,
+                            "position": ch.get("position", 0),
+                        }
+                        if mapped != CATEGORY_TYPE:
+                            kwargs["parent_id"] = parent
+                            kwargs["nsfw"] = ch.get("nsfw", False)
+                            if ch.get("topic"):
+                                kwargs["topic"] = ch["topic"]
+                        new_ch = await self.fluxer_http.create_guild_channel(
+                            fluxer_guild_id, **kwargs
+                        )
+                        fluxer_by_key[(mapped, name)] = new_ch
+                        if mapped == CATEGORY_TYPE:
+                            self.category_id_map[ch["id"]] = new_ch["id"]
+                        else:
+                            self.channel_id_map[ch["id"]] = new_ch["id"]
+                        await self._apply_channel_permissions(ch, new_ch["id"])
+                        self.logger.log(f"  ✓ Created {name}")
+                        created += 1
+                    except Exception as e:
+                        self.logger.log(f"  Failed to create '{name}': {e}", "WARN")
+            else:
+                self.logger.log("Skipped creating channels")
+
+        # --- update existing ---
+        differing: list[tuple[dict[str, Any], int, dict[str, Any]]] = []
+        for ch, mapped in wanted:
+            target = fluxer_by_key.get((mapped, ch.get("name", "")))
+            if not target:
+                continue
+            if mapped == CATEGORY_TYPE:
+                self.category_id_map[ch["id"]] = target["id"]
+            else:
+                self.channel_id_map[ch["id"]] = target["id"]
+
+            wants_parent = None
+            if ch.get("parent_id"):
+                wants_parent = self.category_id_map.get(ch["parent_id"])
+
+            same = (
+                (ch.get("topic") or "") == (target.get("topic") or "")
+                and bool(ch.get("nsfw", False)) == bool(target.get("nsfw", False))
+                and (mapped == CATEGORY_TYPE or wants_parent == target.get("parent_id"))
+            )
+            if same:
+                unchanged += 1
+            else:
+                differing.append((ch, mapped, target))
+
+        if differing:
+            self.logger.log(f"\n{len(differing)} channel(s) differ from Discord:")
+            for ch, _, _ in differing:
+                self.logger.log(f"  • {ch.get('name')}")
+            if confirm(
+                f"  Update these {len(differing)} channel(s) "
+                "(topic, nsfw, category) and re-apply permissions?",
+                default_no=False,
+            ):
+                for ch, mapped, target in differing:
+                    name = ch.get("name", "unnamed")
+                    try:
+                        kwargs: dict[str, Any] = {}
+                        if mapped != CATEGORY_TYPE:
+                            kwargs["nsfw"] = ch.get("nsfw", False)
+                            if ch.get("topic"):
+                                kwargs["topic"] = ch["topic"]
+                            if ch.get("parent_id"):
+                                parent = self.category_id_map.get(ch["parent_id"])
+                                if parent:
+                                    kwargs["parent_id"] = parent
+                        if kwargs:
+                            await self.fluxer_http.modify_channel(
+                                target["id"], **kwargs
+                            )
+                        await self._apply_channel_permissions(ch, target["id"])
+                        self.logger.log(f"  ✓ Updated {name}")
+                        updated += 1
+                    except Exception as e:
+                        self.logger.log(f"  Failed to update '{name}': {e}", "WARN")
+            else:
+                self.logger.log("Skipped channel updates")
+
+        # --- delete extras ---
+        if extra:
+            names = [
+                f"[{'category' if c.get('type') == CATEGORY_TYPE else 'channel'}] "
+                f"{c.get('name', '?')}"
+                for c in extra
+            ]
+            if confirm_deletions("CHANNELS/CATEGORIES", names, self.logger):
+                # Delete children before their categories
+                for ch in sorted(
+                    extra, key=lambda c: 1 if c.get("type") == CATEGORY_TYPE else 0
+                ):
+                    try:
+                        await self.fluxer_http.delete_channel(ch["id"])
+                        self.logger.log(f"  ✓ Deleted {ch.get('name')}")
+                        deleted += 1
+                    except Exception as e:
+                        self.logger.log(
+                            f"  Failed to delete '{ch.get('name')}': {e}", "WARN"
+                        )
+
+        self.logger.log(
+            "Channels: " + summarise(created, updated, deleted, unchanged)
+        )
+
+    async def _sync_emojis(self, guild_id: str, fluxer_guild_id: str):
+        """Create missing emojis and optionally delete extras."""
+        self.logger.log("\n--- Emojis ---")
+
+        try:
+            discord_emojis = await self.discord_http.get_guild_emojis(guild_id)
+            fluxer_emojis = await self.fluxer_http.get_guild_emojis(fluxer_guild_id)
+        except Exception as e:
+            self.logger.log(f"Failed to fetch emojis: {e}", "ERROR")
+            return
+
+        await self._sync_assets(
+            kind="EMOJIS",
+            label="emoji",
+            discord_items=discord_emojis,
+            fluxer_items=fluxer_emojis,
+            create=lambda name, data: self.fluxer_http.create_guild_emoji(
+                fluxer_guild_id, name=name, image=data
+            ),
+            delete=lambda item: self.fluxer_http.delete_guild_emoji(
+                fluxer_guild_id, item["id"]
+            ),
+            url_for=lambda item: (
+                "https://cdn.discordapp.com/emojis/"
+                f"{item['id']}.{'webp' if item.get('animated') else 'png'}?size=128"
+                + ("&animated=true" if item.get("animated") else "")
+            ),
+        )
+
+    async def _sync_stickers(self, guild_id: str, fluxer_guild_id: str):
+        """Create missing stickers and optionally delete extras."""
+        self.logger.log("\n--- Stickers ---")
+
+        try:
+            discord_stickers = await self.discord_http.get_guild_stickers(guild_id)
+            fluxer_stickers = await self.fluxer_http.get_guild_stickers(
+                fluxer_guild_id
+            )
+        except Exception as e:
+            self.logger.log(f"Failed to fetch stickers: {e}", "ERROR")
+            return
+
+        await self._sync_assets(
+            kind="STICKERS",
+            label="sticker",
+            discord_items=discord_stickers,
+            fluxer_items=fluxer_stickers,
+            create=lambda name, data: self.fluxer_http.create_guild_sticker(
+                fluxer_guild_id, name=name, image=data
+            ),
+            delete=lambda item: self.fluxer_http.delete_guild_sticker(
+                fluxer_guild_id, item["id"]
+            ),
+            url_for=lambda item: (
+                f"https://media.discordapp.net/stickers/{item['id']}.png?size=320"
+            ),
+        )
+
+    async def _sync_assets(
+        self,
+        *,
+        kind: str,
+        label: str,
+        discord_items: list[dict[str, Any]],
+        fluxer_items: list[dict[str, Any]],
+        create,
+        delete,
+        url_for,
+    ):
+        """Shared create/delete flow for emojis and stickers.
+
+        Image contents cannot be compared without downloading both sides, so
+        items present on both are left untouched; only additions and removals
+        are handled.
+        """
+        fluxer_names = {i.get("name") for i in fluxer_items}
+        discord_names = {i.get("name") for i in discord_items}
+
+        to_create = [i for i in discord_items if i.get("name") not in fluxer_names]
+        extra = [i for i in fluxer_items if i.get("name") not in discord_names]
+        unchanged = len(discord_items) - len(to_create)
+
+        created = deleted = 0
+
+        if to_create:
+            self.logger.log(f"\n{len(to_create)} {label}(s) missing on Fluxer:")
+            for item in to_create:
+                self.logger.log(f"  • :{item.get('name')}:")
+            if confirm(
+                f"  Create these {len(to_create)} {label}(s)?", default_no=False
+            ):
+                for item in to_create:
+                    name = item.get("name", "unnamed")
+                    data = await self._download_image(url_for(item))
+                    if not data:
+                        self.logger.log(f"  Could not download {label} '{name}'", "WARN")
+                        continue
+                    try:
+                        await create(name, data)
+                        self.logger.log(f"  ✓ Created :{name}:")
+                        created += 1
+                    except Exception as e:
+                        self.logger.log(f"  Failed to create '{name}': {e}", "WARN")
+                    await asyncio.sleep(0.3)
+            else:
+                self.logger.log(f"Skipped creating {label}s")
+
+        if extra:
+            names = [str(i.get("name", "?")) for i in extra]
+            if confirm_deletions(kind, names, self.logger):
+                for item in extra:
+                    try:
+                        await delete(item)
+                        self.logger.log(f"  ✓ Deleted :{item.get('name')}:")
+                        deleted += 1
+                    except Exception as e:
+                        self.logger.log(
+                            f"  Failed to delete '{item.get('name')}': {e}", "WARN"
+                        )
+                    await asyncio.sleep(0.2)
+
+        self.logger.log(
+            f"{kind.title()}: " + summarise(created, 0, deleted, unchanged)
+        )
+
+    async def _apply_role_flags(
+        self,
+        fluxer_guild_id: str,
+        fluxer_role_id: str,
+        role_name: str,
+        *,
+        hoist: bool,
+        mentionable: bool,
+    ) -> bool:
+        """Apply the role settings that Fluxer's create endpoint ignores.
+
+        POST /guilds/{id}/roles accepts `hoist` and `mentionable` but always
+        stores them as false, so "Show this role separately" and "Allow
+        mentions" have to be set with a follow-up PATCH. Role edits are not
+        rate limited, unlike creates.
+        """
+        if not hoist and not mentionable:
+            # Nothing to change; false is already the created state.
+            return True
+
+        try:
+            await self.fluxer_http.modify_guild_role(
+                fluxer_guild_id,
+                fluxer_role_id,
+                hoist=hoist,
+                mentionable=mentionable,
+            )
+            flags = []
+            if hoist:
+                flags.append("hoisted")
+            if mentionable:
+                flags.append("mentionable")
+            self.logger.log(f"    ✓ Set {' + '.join(flags)}")
+            return True
+        except Exception as e:
+            self.logger.log(
+                f"    Failed to set hoist/mentionable for '{role_name}': {e}", "WARN"
+            )
+            return False
+
+    async def _reorder_roles(
+        self, fluxer_guild_id: str, ordered_role_ids: list[str]
+    ):
+        """Reorder roles to match the Discord hierarchy.
+
+        Discord positions are sparse and guild-specific (gaps between values,
+        managed roles mixed in), so they cannot be sent to Fluxer as-is. Instead
+        we send a dense sequence: the lowest-ranked role gets position 1 and the
+        highest-ranked role gets position len(ordered_role_ids). Position 0 is
+        reserved for @everyone, which must stay at the bottom and is never
+        included here.
 
         Args:
             fluxer_guild_id: Fluxer guild ID
-            role_positions: List of {id: fluxer_role_id, position: discord_position}
+            ordered_role_ids: Fluxer role IDs ordered lowest rank first
         """
-        if not role_positions:
+        if not ordered_role_ids:
             return
 
         self.logger.log("\nReordering roles to match Discord hierarchy...")
 
-        # Sort by position (highest first for API)
-        sorted_positions = sorted(
-            role_positions, key=lambda x: x["position"], reverse=True
-        )
+        # Dense positions starting at 1 (@everyone keeps 0 at the bottom)
+        payload = [
+            {"id": role_id, "position": index}
+            for index, role_id in enumerate(ordered_role_ids, start=1)
+        ]
 
         # Fluxer/Discord use PATCH /guilds/{guild_id}/roles with array of {id, position}
         try:
@@ -246,9 +905,9 @@ class ServerMigrator:
 
             await self.fluxer_http.request(
                 Route("PATCH", "/guilds/{guild_id}/roles", guild_id=fluxer_guild_id),
-                json=sorted_positions,
+                json=payload,
             )
-            self.logger.log(f"✓ Reordered {len(sorted_positions)} roles")
+            self.logger.log(f"✓ Reordered {len(payload)} roles")
         except Exception as e:
             self.logger.log(f"Failed to reorder roles: {e}", "WARN")
             self.logger.log(
@@ -273,10 +932,12 @@ class ServerMigrator:
         # Build a name-to-role map for existing roles
         existing_roles_by_name = {r["name"]: r for r in existing_fluxer_roles}
 
-        # Track role positions for reordering later
-        role_positions_to_set = []
+        # Fluxer role IDs in final hierarchy order, lowest rank first
+        ordered_fluxer_role_ids: list[str] = []
 
-        # Map @everyone role (it exists by default in Fluxer, so we just need to map IDs)
+        # Map @everyone role (it exists by default in Fluxer, so we just need to map IDs).
+        # It is deliberately left out of the reorder payload: @everyone is pinned to
+        # position 0 at the bottom of the hierarchy and cannot be moved.
         everyone_role = next((r for r in roles if r.get("name") == "@everyone"), None)
         if everyone_role:
             fluxer_everyone = existing_roles_by_name.get("@everyone")
@@ -285,77 +946,122 @@ class ServerMigrator:
                 self.logger.log(
                     f"Mapped @everyone role (Discord: {everyone_role['id']} → Fluxer: {fluxer_everyone['id']})"
                 )
-                # Add @everyone to positions
-                role_positions_to_set.append(
-                    {
-                        "id": fluxer_everyone["id"],
-                        "position": everyone_role.get("position", 0),
-                    }
-                )
 
         # Skip @everyone role from creation (it already exists)
         roles = [r for r in roles if r.get("name") != "@everyone"]
 
-        # Sort by position (lowest first)
-        for role in sorted(roles, key=lambda r: r.get("position", 0)):
-            role_name = role["name"]
-            role_id = role["id"]
-            discord_position = role.get("position", 0)
-            color = role.get("color", 0)
-            permissions = int(role.get("permissions", 0))
-            hoist = role.get("hoist", False)
-            mentionable = role.get("mentionable", False)
-
-            # Check if role already exists (partial sync)
-            if role_name in existing_roles_by_name:
-                existing_role = existing_roles_by_name[role_name]
-                fluxer_role_id = existing_role["id"]
-                self.role_id_map[role_id] = fluxer_role_id
-                self.logger.log(f"Skipping role (already exists): {role_name}")
+        # Managed roles belong to bots/integrations; Fluxer cannot recreate them and
+        # copying them as plain roles would distort the hierarchy.
+        managed_roles = [r for r in roles if r.get("managed")]
+        if managed_roles:
+            for role in managed_roles:
                 self.logger.log(
-                    f"  Mapped: Discord {role_id} → Fluxer {fluxer_role_id}"
+                    f"Skipping managed (bot/integration) role: {role['name']}"
                 )
+            roles = [r for r in roles if not r.get("managed")]
 
-                # Add to positions for reordering
-                role_positions_to_set.append(
-                    {"id": fluxer_role_id, "position": discord_position}
-                )
-                continue
+        # Create from the bottom of the hierarchy up. Discord's `position` is sparse,
+        # so it is used only to establish relative order, never sent to Fluxer.
+        # Ties are broken by role ID (older role first) to match Discord's own ordering.
+        #
+        # Roles are always created at position 1 by Fluxer; the ordering is applied
+        # by the reorder PATCH below. That reorder therefore runs even if this loop
+        # is interrupted, otherwise every role would be left tied at position 1 and
+        # the hierarchy would show in creation order (newest first).
+        interrupted = False
+        try:
+            for role in sorted(
+                roles, key=lambda r: (r.get("position", 0), int(r["id"]))
+            ):
+                role_name = role["name"]
+                role_id = role["id"]
+                color = role.get("color", 0)
+                permissions = int(role.get("permissions", 0))
+                hoist = role.get("hoist", False)
+                mentionable = role.get("mentionable", False)
 
-            self.logger.log(f"Creating role: {role_name}")
-            self.logger.log(f"  Color: #{color:06x}")
-            self.logger.log(f"  Permissions: {permissions}")
+                # Check if role already exists (partial sync)
+                if role_name in existing_roles_by_name:
+                    existing_role = existing_roles_by_name[role_name]
+                    fluxer_role_id = existing_role["id"]
+                    self.role_id_map[role_id] = fluxer_role_id
+                    self.logger.log(f"Skipping role (already exists): {role_name}")
+                    self.logger.log(
+                        f"  Mapped: Discord {role_id} → Fluxer {fluxer_role_id}"
+                    )
 
-            try:
-                fluxer_role = await self.fluxer_http.create_guild_role(
-                    fluxer_guild_id,
-                    name=role_name,
-                    permissions=permissions,
-                    color=color,
-                    hoist=hoist,
-                    mentionable=mentionable,
-                )
+                    # Keep in hierarchy order for reordering
+                    ordered_fluxer_role_ids.append(fluxer_role_id)
+                    continue
 
-                fluxer_role_id = fluxer_role["id"]
-                self.role_id_map[role_id] = fluxer_role_id
-                self.logger.log(f"  ✓ Role created with ID: {fluxer_role_id}")
+                self.logger.log(f"Creating role: {role_name}")
+                self.logger.log(f"  Color: #{color:06x}")
+                self.logger.log(f"  Permissions: {permissions}")
 
-                # Add to positions for reordering
-                role_positions_to_set.append(
-                    {"id": fluxer_role_id, "position": discord_position}
-                )
+                try:
+                    fluxer_role = await self.fluxer_http.create_guild_role(
+                        fluxer_guild_id,
+                        name=role_name,
+                        permissions=permissions,
+                        color=color,
+                        hoist=hoist,
+                        mentionable=mentionable,
+                    )
 
-                # Add delay to avoid rate limiting
-                await asyncio.sleep(3.0)
+                    fluxer_role_id = fluxer_role["id"]
+                    self.role_id_map[role_id] = fluxer_role_id
+                    self.logger.log(f"  ✓ Role created with ID: {fluxer_role_id}")
 
-            except Exception as e:
-                self.logger.log(f"  Failed to create role '{role_name}': {e}", "WARN")
+                    # Fluxer's create endpoint ignores hoist/mentionable, so they
+                    # have to be applied with a follow-up edit.
+                    await self._apply_role_flags(
+                        fluxer_guild_id,
+                        fluxer_role_id,
+                        role_name,
+                        hoist=hoist,
+                        mentionable=mentionable,
+                    )
 
-        self.logger.log(f"✓ Migrated {len(roles)} roles")
+                    # Keep in hierarchy order for reordering
+                    ordered_fluxer_role_ids.append(fluxer_role_id)
+
+                    # Pacing is handled by RateLimitedClient before each create
+
+                except Exception as e:
+                    self.logger.log(f"  Failed to create role '{role_name}': {e}", "WARN")
+
+        except KeyboardInterrupt:
+            interrupted = True
+            self.logger.log(
+                "Interrupted - applying role order for the roles created so far...",
+                "WARN",
+            )
+
+        self.logger.log(f"✓ Migrated {len(ordered_fluxer_role_ids)} roles")
+
+        # Partial sync: roles that exist only in Fluxer are not part of the Discord
+        # hierarchy. Keep them above the migrated roles (preserving their relative
+        # order) so they are not left sharing positions with the roles we just placed.
+        migrated_ids = set(ordered_fluxer_role_ids)
+        fluxer_only_roles = [
+            r
+            for r in existing_fluxer_roles
+            if r["id"] not in migrated_ids and r.get("name") != "@everyone"
+        ]
+        if fluxer_only_roles:
+            ordered_fluxer_role_ids += [
+                r["id"]
+                for r in sorted(fluxer_only_roles, key=lambda r: r.get("position", 0))
+            ]
 
         # Reorder all roles to match Discord hierarchy
-        if role_positions_to_set:
-            await self._reorder_roles(fluxer_guild_id, role_positions_to_set)
+        if ordered_fluxer_role_ids:
+            await self._reorder_roles(fluxer_guild_id, ordered_fluxer_role_ids)
+
+        # Ctrl+C still cancels the migration, but only after the roles that were
+        # created have been put in the right order.
+        if interrupted:
+            raise KeyboardInterrupt
 
     async def _apply_channel_permissions(
         self, discord_channel: dict[str, Any], fluxer_channel_id: str
@@ -460,8 +1166,7 @@ class ServerMigrator:
                 if migrate_permissions:
                     await self._apply_channel_permissions(category, fluxer_category_id)
 
-                # Add delay to avoid rate limiting
-                await asyncio.sleep(3.0)
+                # Pacing is handled by RateLimitedClient before each create
 
             except Exception as e:
                 self.logger.log(
@@ -529,7 +1234,6 @@ class ServerMigrator:
                         )
 
                     channel_count += 1
-                    await asyncio.sleep(3.0)
                 except Exception as e:
                     self.logger.log(
                         f"  Failed to create text channel '{channel_name}': {e}", "WARN"
@@ -580,7 +1284,6 @@ class ServerMigrator:
                         )
 
                     channel_count += 1
-                    await asyncio.sleep(3.0)
                 except Exception as e:
                     self.logger.log(
                         f"  Failed to create voice channel '{channel_name}': {e}",
@@ -636,7 +1339,6 @@ class ServerMigrator:
                         )
 
                     channel_count += 1
-                    await asyncio.sleep(3.0)
                 except Exception as e:
                     self.logger.log(
                         f"  Failed to convert forum '{channel_name}': {e}", "WARN"
@@ -742,8 +1444,9 @@ class ServerMigrator:
                 self.logger.log(f"  ✓ Emoji created")
                 emoji_count += 1
 
-                # Rate limiting
-                await asyncio.sleep(3.0)
+                # Emoji/sticker creation is not rate limited server-side;
+                # a short delay keeps uploads from saturating the connection.
+                await asyncio.sleep(0.3)
 
             except Exception as e:
                 self.logger.log(f"  Failed to create emoji '{emoji_name}': {e}", "WARN")
@@ -846,8 +1549,9 @@ class ServerMigrator:
                 self.logger.log(f"  ✓ Sticker created")
                 sticker_count += 1
 
-                # Rate limiting
-                await asyncio.sleep(3.0)
+                # Emoji/sticker creation is not rate limited server-side;
+                # a short delay keeps uploads from saturating the connection.
+                await asyncio.sleep(0.3)
 
             except Exception as e:
                 self.logger.log(

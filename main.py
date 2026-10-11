@@ -486,6 +486,116 @@ class MigrationOrchestrator:
             # Small delay between servers
             await asyncio.sleep(1)
 
+    async def select_fluxer_guild_for_reconfigure(self) -> str | None:
+        """Pick which Fluxer server to reconfigure. Returns None to cancel."""
+        print("\nFetching your Fluxer servers...")
+        try:
+            fluxer_guilds = await self.fluxer_http.get_current_user_guilds()
+        except Exception as e:
+            print(f"Failed to fetch Fluxer servers: {e}")
+            return None
+
+        if not fluxer_guilds:
+            print("\nYou're not in any Fluxer servers yet!")
+            return None
+
+        print("\n" + "=" * 80)
+        print("YOUR FLUXER SERVERS")
+        print("=" * 80)
+        for i, guild in enumerate(fluxer_guilds, 1):
+            owner_mark = " [OWNER]" if guild.get("owner") else ""
+            print(f"  [{i}] {guild['name']}{owner_mark}")
+
+        while True:
+            choice = input("\nSelect a server (or 'cancel'): ").strip()
+            if choice.lower() == "cancel":
+                return None
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(fluxer_guilds):
+                    selected = fluxer_guilds[idx]
+                    print(f"\n✓ Will reconfigure: {selected['name']}")
+                    return selected["id"]
+            except ValueError:
+                pass
+            print("Invalid choice. Try again.")
+
+    def select_reconfigure_phases(self) -> dict[str, bool] | None:
+        """Choose which parts of the server to reconfigure."""
+        print("\nWhat should be reconfigured?")
+        print("  [1] Everything (recommended)")
+        print("  [2] Roles only")
+        print("  [3] Channels & categories only")
+        print("  [4] Emojis & stickers only")
+        print("  [5] Choose individually")
+        print("  [6] Cancel")
+
+        choice = input("\nYour choice: ").strip()
+
+        if choice == "1":
+            return {
+                "settings": True,
+                "roles": True,
+                "channels": True,
+                "emojis": True,
+                "stickers": True,
+            }
+        if choice == "2":
+            return {"roles": True}
+        if choice == "3":
+            return {"channels": True}
+        if choice == "4":
+            return {"emojis": True, "stickers": True}
+        if choice == "5":
+            phases = {}
+            for key, label in (
+                ("settings", "Server settings (name, icon)"),
+                ("roles", "Roles"),
+                ("channels", "Channels & categories"),
+                ("emojis", "Emojis"),
+                ("stickers", "Stickers"),
+            ):
+                answer = input(f"  Include {label}? (y/n): ").strip().lower()
+                phases[key] = answer in ("y", "yes")
+            if not any(phases.values()):
+                print("Nothing selected.")
+                return None
+            return phases
+        return None
+
+    async def reconfigure_servers(self, servers: list[dict[str, Any]]):
+        """Sync an already-migrated Fluxer server back in line with Discord."""
+        server_migrator = ServerMigrator(
+            self.discord_http, self.fluxer_http, self.logger
+        )
+
+        for guild in servers:
+            print("\n" + "=" * 80)
+            print(f"Discord Server: {guild['name']}")
+            print("=" * 80)
+            print("\nReconfigure compares Discord against an existing Fluxer")
+            print("server and can:")
+            print("  - CREATE items that are missing on Fluxer")
+            print("  - UPDATE items whose settings differ")
+            print("  - DELETE Fluxer items that no longer exist in Discord")
+            print("\n⚠ You are asked before every change, and deletions are")
+            print("  always listed in full and confirmed separately.")
+
+            phases = self.select_reconfigure_phases()
+            if phases is None:
+                print(f"\nSkipping {guild['name']}")
+                continue
+
+            fluxer_guild_id = await self.select_fluxer_guild_for_reconfigure()
+            if fluxer_guild_id is None:
+                print(f"\nSkipping {guild['name']}")
+                continue
+
+            await server_migrator.reconfigure_server(
+                guild, fluxer_guild_id, phases=phases
+            )
+            await asyncio.sleep(1)
+
     async def run(self):
         """Main migration flow."""
         print("=" * 80)
@@ -543,7 +653,8 @@ class MigrationOrchestrator:
                 print("  [1] Migrate Profile")
                 print("  [2] Migrate Servers")
                 print("  [3] Migrate Profile + Servers")
-                print("  [4] Exit")
+                print("  [4] Reconfigure / Sync an existing Fluxer server")
+                print("  [5] Exit")
                 print("\nℹ️  Navigation: Enter a number, or press Ctrl+C to exit")
 
                 choice = input("\nYour choice: ").strip()
@@ -564,6 +675,11 @@ class MigrationOrchestrator:
                         await self.migrate_servers(servers)
 
                 elif choice == "4":
+                    servers = self.select_servers()
+                    if servers:
+                        await self.reconfigure_servers(servers)
+
+                elif choice == "5":
                     break
 
                 else:
@@ -588,7 +704,7 @@ class MigrationOrchestrator:
             await asyncio.sleep(0.25)
 
             print("\n" + "=" * 80)
-            print("Migration complete!")
+            print("Migration finished.")
             print("=" * 80)
 
 
